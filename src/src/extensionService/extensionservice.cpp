@@ -1,0 +1,168 @@
+// SPDX-FileCopyrightText: 2022-2026 UnionTech Software Technology Co., Ltd.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/**
+ * @copyright 2021-2021 Uniontech Technology Co., Ltd.
+ *
+ * @file extensionservice.cpp
+ *
+ * @brief Websocket服务
+ *
+ * @date 2021-06-29 16:00
+ *
+ * Author: zhaoyue  <zhaoyue@uniontech.com>
+ *
+ * Maintainer: zhaoyue  <zhaoyue@uniontech.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+**/
+
+
+#include "extensionservice.h"
+
+#include <QWebSocketCorsAuthenticator>
+#include <QWebSocketServer>
+#include <QWebChannel>
+#include <QWebSocket>
+#include <QProcess>
+#include <QTimer>
+#include <QDBusMessage>
+#include <QDBusConnection>
+#include <QDBusInterface>
+#include <QDBusPendingCall>
+#include <QCoreApplication>
+#include <QDebug>
+
+#include "websocketclientwrapper.h"
+#include "websockettransport.h"
+#include "websockethandle.h"
+
+namespace {
+const QString kAllowedExtensionOrigin =
+        QStringLiteral("chrome-extension://ojlicckikdkkaclkpdddijgehekpmmbg");
+}
+
+QStringList runPipeProcess(const QString &command, const QString &filter)
+{
+    QProcess process;
+    process.start(command);
+    process.waitForFinished();
+
+    QString comStr = process.readAllStandardOutput();
+    QStringList lines = comStr.split('\n');
+    QStringList filteredLines;
+    if(filter.isEmpty()) {
+        return lines; //返回所有
+    }
+    // 过滤包含指定关键字的行
+    for (const QString &line : lines) {
+        if (line.contains(filter, Qt::CaseInsensitive)) {
+            filteredLines.append(line);
+        }
+    }
+
+    // 合并过滤后的行并返回
+    return filteredLines;   // 返回以换行符分隔的字符串
+}
+
+
+extensionService::extensionService()
+{
+    qDebug() << "[ExtensionService] Initializing WebSocket service";
+    initWebsokcet();
+}
+
+extensionService::~extensionService()
+{
+    qDebug() << "[ExtensionService] Destroying WebSocket service";
+    delete m_timer;
+}
+
+void extensionService::initWebsokcet()
+{
+    qDebug() << "[ExtensionService] Initializing WebSocket server";
+
+    m_server = new QWebSocketServer(QStringLiteral("QWebChannel Server"), QWebSocketServer::NonSecureMode);
+    connect(m_server, &QWebSocketServer::originAuthenticationRequired,
+            this, [](QWebSocketCorsAuthenticator *authenticator) {
+        const QString requestedOrigin = authenticator->origin();
+        QString origin = requestedOrigin;
+        // Qt versions may expose extension origins with a trailing slash.
+        if (origin.endsWith(QLatin1Char('/'))) {
+            origin.chop(1);
+        }
+        const bool allowed = origin == kAllowedExtensionOrigin;
+        authenticator->setAllowed(allowed);
+        if (!allowed) {
+            qWarning() << "[ExtensionService] Rejected WebSocket origin:" << requestedOrigin;
+        }
+    });
+    if (!m_server->listen(QHostAddress("127.0.0.1"), 12345)) {
+        qWarning() << "[ExtensionService] Failed to start WebSocket server on port 12345";
+        qFatal("Failed to open web socket server.");
+    }
+    qDebug() << "[ExtensionService] WebSocket server started successfully";
+    WebSocketClientWrapper* clientWrapper = new WebSocketClientWrapper(m_server);
+    QWebChannel* channel = new QWebChannel;
+    QObject::connect(clientWrapper, &WebSocketClientWrapper::clientConnected,
+                     channel, &QWebChannel::connectTo);
+    Websockethandle* core = new Websockethandle;
+    channel->registerObject(QStringLiteral("core"), core);
+    connect(core, &Websockethandle::sendWebText, this, [&](QString text) {
+         QTimer::singleShot(50, this, [=](){
+             sendUrlToDownloader(text);
+         });
+    });
+    m_timer = new QTimer;
+    m_timer->start(60000);
+    connect(m_timer, &QTimer::timeout, this, &extensionService::checkConnection);
+}
+
+void extensionService::sendUrlToDownloader(const QString &url)
+{
+    qDebug() << "[ExtensionService] Sending URL to downloader:" << url;
+
+    QProcess proc;
+    proc.startDetached("downloader", QStringList() << url);
+    QTimer *timer = new QTimer;
+    timer->start(50);
+    connect(timer, &QTimer::timeout, this, [=](){
+       QDBusInterface iface("com.downloader.service",
+                             "/downloader/path",
+                             "local.downloader.MainFrame",
+                             QDBusConnection::sessionBus());
+       QDBusMessage m = iface.call("onReceiveExtentionUrl", url);
+       QString msg = m.errorMessage();
+       if(msg.isEmpty()) {
+           qDebug() << "[ExtensionService] URL successfully sent to downloader";
+           timer->stop();
+       }
+    });
+}
+
+void extensionService::checkConnection()
+{
+    qDebug() << "[ExtensionService] Checking WebSocket connections";
+
+    QStringList strList = runPipeProcess("netstat -apn", "dlmextensions");
+    for(QString str : strList) {
+        if(str.contains("ESTABLISHED")) {  //存在websocket链接
+            qDebug() << "[ExtensionService] Active WebSocket connection found";
+            return;
+        }
+    }
+    qDebug() << "[ExtensionService] No active connections, exiting";
+    qApp->exit(0);
+}

@@ -1,0 +1,14 @@
+*.user*
+*.qm
+downloadmanager.ts
+build/
+.vscode/
+.cache/
+build*/
+obj-x86_64-linux-gnu/
+
+# AI config
+.promptx/
+.spec-workflow/
+.cursor/
+.specstory/
